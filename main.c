@@ -19,8 +19,17 @@
 #define port 8080
 #define buff_size 10240
 #define max_request 100
+#define response_size 1024
+#define file_name_size 20
 
 regex_t regex;
+size_t memo_index = 0;
+struct timeval t0, t1;
+struct resp_memo {
+    size_t length;
+    char response[response_size];
+    char file_name[file_name_size];
+} memo[5] = {};
 
 void *handle_client(void *agr);
 void build_http_response(const char *file_name, char *response);
@@ -69,6 +78,8 @@ int main(int argc, char *argv[]) {
 }
 
 void *handle_client(void *arg) {
+    gettimeofday(&t0, NULL);
+
     int client_fd = *((int *)arg);
     char *buffer = (char *)malloc(buff_size * sizeof(char));
 
@@ -82,9 +93,29 @@ void *handle_client(void *arg) {
 	const char *url_enconded_file_name = buffer + matches[1].rm_so;
 	char *file_name = url_decode(url_enconded_file_name);
 
+	size_t index = -1;
+	bool is_cached = false;
+	for (size_t i = 0; i < memo_index; i++) {
+	    if (strcmp(file_name, memo[i].file_name) == 0) {
+		index = i;
+		is_cached = true;
+		break;
+	    }
+	}
+
 	char *response = (char *)malloc(buff_size * sizeof(char));
 	build_http_response(file_name, response);
 	send(client_fd, response, strlen(response), 0);
+	if (is_cached) {
+	    send(client_fd, memo[index].response, memo[index].length, 0);
+	    printf("cached %s\n", memo[index].file_name);
+	} else {
+	    char *response = (char *)malloc(buff_size * sizeof(char));
+	    build_http_response(file_name, response);
+	    send(client_fd, response, strlen(response), 0);
+
+	    free(response);
+	}
 
 	free(response);
 
@@ -94,6 +125,9 @@ void *handle_client(void *arg) {
     close(client_fd);
     free(arg);
     free(buffer);
+
+    gettimeofday(&t1, NULL);
+    printf("Did it in %.2g seconds\n", t1.tv_sec - t0.tv_sec + 1E-6 * (t1.tv_usec - t0.tv_usec));
 
     return NULL;
 }
@@ -120,6 +154,11 @@ void build_http_response(const char *file_name, char *response) {
     off_t file_size = file_stat.st_size;
 
     fread(response+strlen(response), sizeof(char), file_size, fp);
+
+    strncpy(memo[memo_index].response, response, response_size);
+    strncpy(memo[memo_index].file_name, file_name, 10);
+    memo[memo_index].length = strlen(response);
+    if (memo_index < 5) { memo_index++; }
 
     close(file_fd);
     fclose(fp);
