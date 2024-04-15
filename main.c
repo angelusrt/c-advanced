@@ -14,34 +14,108 @@
 #include <unistd.h>
 #include <sys/time.h>
 
-#include "utils.h"
-
+#define is_debug_enable true
 #define port 8080
-#define buff_size 10240
+#define buff_size 2056
 #define max_request 100
-#define response_size 1024
 #define file_name_size 20
+#define file_path_size 30
+#define static_folder "static/"
+
+#if is_debug_enable
+    struct timeval t0, t1;
+#endif
 
 regex_t regex;
 size_t memo_index = 0;
-struct timeval t0, t1;
 struct resp_memo {
     size_t length;
-    char response[response_size];
+    char response[buff_size];
     char file_name[file_name_size];
 } memo[5] = {};
 
 void *handle_client(void *agr);
 void build_http_response(const char *file_name, char *response);
 
+const char *get_file_extension(const char *file_name) {
+    const char *dot = strrchr(file_name, '.');
+    if (dot == NULL || dot == file_name) { return ""; }
+    return dot + 1;
+}
+
+const char *get_mime_type(const char *file_ext) {
+    switch (file_ext[0]) {
+	case 'h': return "text/html";
+	case 't': return "text/plain";
+	case 'j': return "image/jpeg";
+	case 'p': return "image/png";
+	default: return "text/html";
+    }
+}
+
 void exit_in_failure(int status, const char *message){
     if (status == -1) { perror(message); exit(EXIT_FAILURE); }
+}
+
+void load_memo() {
+    const char default_response[] = "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\n404 Not Found";
+    snprintf(memo[memo_index].response, buff_size, default_response);
+    snprintf(memo[memo_index].file_name, buff_size, "default");
+    memo[memo_index].length = strlen(default_response);
+    memo_index++;
+
+    struct dirent *ent;
+    DIR *dir = opendir(static_folder);
+
+    if (dir == NULL) {
+	perror("Could not open folder"); 
+	exit(EXIT_FAILURE);
+    }
+    ent = readdir(dir);
+    while (ent != NULL) {
+	char file_path[file_path_size] = static_folder;
+	printf("found %s inside static/ \n", ent->d_name);
+
+	if (strcmp(ent->d_name, ".") != 0 && strcmp(ent->d_name, "..") != 0){
+	    strncat(file_path, ent->d_name, file_path_size);
+
+	    int file_fd = open(file_path, O_RDONLY);
+	    FILE *fp = fopen(file_path, "r");
+
+	    if (fp == NULL || file_fd == -1) {
+		perror("could not open file");
+		exit(EXIT_FAILURE);
+	    }
+
+	    char file_ext[32];
+	    strcpy(file_ext, get_file_extension(ent->d_name));
+	    const char *mime_type = get_mime_type(file_ext);
+	    snprintf(memo[memo_index].response, buff_size, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n\r\n", mime_type);
+
+	    struct stat file_stat;
+	    fstat(file_fd, &file_stat);
+	    off_t file_size = file_stat.st_size;
+
+	    fread(memo[memo_index].response+strlen(memo[memo_index].response), sizeof(char), file_size, fp);
+	    strncpy(memo[memo_index].file_name, ent->d_name, 10);
+	    memo[memo_index].length = strlen(memo[memo_index].response);
+	    if (memo_index < 5) { memo_index++; }
+
+	    close(file_fd);
+	    fclose(fp);
+	}
+
+	ent = readdir(dir);
+    }
+
+    closedir(dir);
 }
 
 int main(int argc, char *argv[]) {
     // initialization
     short reg_status = regcomp(&regex, "^GET /([^ ]*) HTTP/1", REG_EXTENDED);
     exit_in_failure(reg_status, "regex compilation failed");
+    load_memo();
     // initialization-end
 
     struct sockaddr_in server_addr;
@@ -78,7 +152,9 @@ int main(int argc, char *argv[]) {
 }
 
 void *handle_client(void *arg) {
-    gettimeofday(&t0, NULL);
+    #if is_debug_enable
+	gettimeofday(&t0, NULL);
+    #endif
 
     int client_fd = *((int *)arg);
     char *buffer = (char *)malloc(buff_size * sizeof(char));
@@ -88,78 +164,32 @@ void *handle_client(void *arg) {
     short regexec_status = regexec(&regex, buffer, 2, matches, 0);
 
     if(bytes_received > 0 && regexec_status == 0) {
+	#if is_debug_enable
+	    printf("buffer: %s\n", buffer);
+	    printf("buffer size: %ld\n", strlen(buffer));
+	#endif
+
 	buffer[matches[1].rm_eo] = '\0';
+	char *file_name = buffer + matches[1].rm_so;
 
-	const char *url_enconded_file_name = buffer + matches[1].rm_so;
-	char *file_name = url_decode(url_enconded_file_name);
+	#if is_debug_enable
+	    printf("file name: %s\n",file_name);
+	#endif
 
-	size_t index = -1;
-	bool is_cached = false;
-	for (size_t i = 0; i < memo_index; i++) {
-	    if (strcmp(file_name, memo[i].file_name) == 0) {
-		index = i;
-		is_cached = true;
-		break;
-	    }
-	}
-
-	char *response = (char *)malloc(buff_size * sizeof(char));
-	build_http_response(file_name, response);
-	send(client_fd, response, strlen(response), 0);
-	if (is_cached) {
-	    send(client_fd, memo[index].response, memo[index].length, 0);
-	    printf("cached %s\n", memo[index].file_name);
-	} else {
-	    char *response = (char *)malloc(buff_size * sizeof(char));
-	    build_http_response(file_name, response);
-	    send(client_fd, response, strlen(response), 0);
-
-	    free(response);
-	}
-
-	free(response);
-
-	free(file_name);
+	if (file_name[0] == '\0')
+	    send(client_fd, memo[1].response, memo[1].length, 0);
+	else
+	    send(client_fd, memo[0].response, memo[0].length, 0);
     }
 
     close(client_fd);
     free(arg);
     free(buffer);
 
-    gettimeofday(&t1, NULL);
-    printf("Did it in %.2g seconds\n", t1.tv_sec - t0.tv_sec + 1E-6 * (t1.tv_usec - t0.tv_usec));
+    #if is_debug_enable
+	gettimeofday(&t1, NULL);
+	printf("Did it in: %.2g seconds\n", t1.tv_sec - t0.tv_sec + 1E-6 * (t1.tv_usec - t0.tv_usec));
+    #endif
 
     return NULL;
-}
-
-void build_http_response(const char *file_name, char *response) {
-    int file_fd = open(file_name, O_RDONLY);
-    FILE *fp = fopen(file_name, "r");
-
-    if (fp == NULL || file_fd == -1) {
-	printf("not found\n");
-	snprintf(response, buff_size, "HTTP/1.1 404 Not Found\r\nContent-Type: text/plain\r\n\r\n404 Not Found");
-	return;
-    }
-
-    printf("found %s\n", file_name);
-
-    char file_ext[32];
-    strcpy(file_ext, get_file_extension(file_name));
-    const char *mime_type = get_mime_type(file_ext);
-    snprintf(response, buff_size, "HTTP/1.1 200 OK\r\nContent-Type: %s\r\n\r\n", mime_type);
-
-    struct stat file_stat;
-    fstat(file_fd, &file_stat);
-    off_t file_size = file_stat.st_size;
-
-    fread(response+strlen(response), sizeof(char), file_size, fp);
-
-    strncpy(memo[memo_index].response, response, response_size);
-    strncpy(memo[memo_index].file_name, file_name, 10);
-    memo[memo_index].length = strlen(response);
-    if (memo_index < 5) { memo_index++; }
-
-    close(file_fd);
-    fclose(fp);
 }
